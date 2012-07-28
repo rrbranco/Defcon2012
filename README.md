@@ -1,4 +1,8 @@
 Defcon2012
 ==========
 
-Defcon 2012 Dwarf Exploitation Materials
+Overwriting the Exception Handling Cache Pointer - Dwarf Oriented Programming
+
+James Oakley (Electron)
+Sergey Bratus 
+Rodrigo Rubira Branco (BSDaemon)
